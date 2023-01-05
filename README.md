@@ -17,6 +17,7 @@ This wrapper works under certain assumptions:
 - Each collection has documents of uniform structure
 - Any array or set contains elements of the same type
 - Any field of a document json structure can be missing, except `_id`
+- There's no custom document cache on your side (otherwise it will ruin some internal logic)
 
 
 # Defining a basic document wrapper
@@ -182,7 +183,7 @@ async with doc.command_maker() as fake_doc:
 ```
 
 
-# How do I usnet fields?
+# How do I unset fields?
 
 To unset a field using this interface you should set it to `...` (Ellipsis).
 
@@ -214,3 +215,8 @@ Currently only these operations are supported:
 - `pop`
 
 I'm planning to add `__iadd__` soon.
+
+
+# Cache
+
+This ODM's cache is lazy. It means that at the beginning the cache is empty, until a document is requested from the database. In this case this document gets fetched and cached. If cache lifetime is specified as X seconds, the ODM removes objects that were used more than X seconds ago right before caching a new document, i.e. it may delete some documents a bit later than expected. If more documents are to be cached it is guaranteed that the ODM will uncache all "old" documents. The time of last usage of a document gets updated by `NiceCollection.find` and `NiceCollection.get_cached_or_minimal` methods.

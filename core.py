@@ -388,7 +388,6 @@ class CommandMaker:
             if field is None:
                 field = underlying_owner._nice_nestings[magic._name]
 
-            to_raw = field.to_raw
             route = underlying_owner.route_prefix + (field.real_name or magic._name)
 
             if to_set is Ellipsis:
@@ -396,13 +395,13 @@ class CommandMaker:
                 setattr(underlying_owner, magic._name, field.default)
 
             elif to_set is not MISSING:
-                setters[route] = to_raw(to_set)
+                setters[route] = field.to_raw(to_set)
                 setattr(underlying_owner, magic._name, to_set)
 
             containter = None
 
             if to_add:
-                adders[route].extend(to_raw(to_add))
+                adders[route].extend(field.to_raw(to_add))
                 containter = getattr(underlying_owner, magic._name)
                 if isinstance(containter, list):
                     containter.extend(to_add)
@@ -411,7 +410,7 @@ class CommandMaker:
 
             if to_remove:
                 containter = containter or getattr(underlying_owner, magic._name)
-                removers[route].extend(to_raw(to_remove))
+                removers[route].extend(field.to_raw(to_remove))
                 for el in to_remove:
                     containter.remove(el)
 
@@ -489,10 +488,9 @@ class CommandMaker:
         return self._parent._underlying
 
     def _iter_leaves(self) -> Generator["CommandMaker", None, None]:
-        values = itertools.chain(
+        for magic in itertools.chain(
             self._pseudo_attrs.values(), self._pseudo_nestings.values()
-        )
-        for magic in values:
+        ):
             if magic._pseudo_attrs:
                 yield from magic._iter_leaves()
             elif magic._pseudo_nestings:
@@ -612,11 +610,11 @@ class NiceNesting(metaclass=FieldExtractingMeta):
         # I want an IDE to autocomplete attribute names
         return CommandMaker(self.route_prefix, underlying=self)  # type: ignore
 
+    cmdmk = command_maker
+
 
 class NiceDocument(NiceNesting):
-    """A base class for wrappers of documents.
-    All subclasses must overwrite the `convert_data` method.
-    """
+    """The base class for document wrappers"""
 
     def __init__(self, data: Dict[str, Any], collection: "NiceCollection"):
         super().__init__(attr_name="", data=data, parent=None)
@@ -672,7 +670,7 @@ class NiceDocument(NiceNesting):
         cache_lifetime: Optional[`float`]
             For how many seconds a document should be cached.
             If this parameter is `None`, all documents stay cached forever.
-            Defaults to `None`.
+            If 0, nothing gets cached. Defaults to `None`.
         """
         return NiceCollection(collection, cls, cache_lifetime)
 
