@@ -365,122 +365,127 @@ class CommandMaker:
 
     async def __aexit__(self, exc: Any, *_) -> None:
         if exc is not None:
+            self._clear_references()
             return
 
-        mongo_command = {}
-        setters = {}
-        unsetters = {}
-        adders = defaultdict(list)
-        removers = defaultdict(list)
+        try:
+            mongo_command = {}
+            setters = {}
+            unsetters = {}
+            adders = defaultdict(list)
+            removers = defaultdict(list)
 
-        for magic in self._iter_leaves():
-            to_set = magic._value
-            to_add = magic._to_add
-            to_remove = magic._to_remove
-            to_update = magic._to_update
-            to_pop = magic._to_pop
+            for magic in self._iter_leaves():
+                to_set = magic._value
+                to_add = magic._to_add
+                to_remove = magic._to_remove
+                to_update = magic._to_update
+                to_pop = magic._to_pop
 
-            underlying_owner = magic._get_underlying_owner()
-            if not isinstance(underlying_owner, NiceNesting):
-                raise ValueError("Updating irrelevant attributes is not allowed")
-            # this also ensures that the user updated an existing field
-            field = underlying_owner._fields.get(magic._name)
-            if field is None:
-                field = underlying_owner._nice_nestings[magic._name]
+                underlying_owner = magic._get_underlying_owner()
+                if not isinstance(underlying_owner, NiceNesting):
+                    raise ValueError("Updating irrelevant attributes is not allowed")
+                # this also ensures that the user updated an existing field
+                field = underlying_owner._fields.get(magic._name)
+                if field is None:
+                    field = underlying_owner._nice_nestings[magic._name]
 
-            to_raw = field.to_raw
-            route = underlying_owner.route_prefix + (field.real_name or magic._name)
+                to_raw = field.to_raw
+                route = underlying_owner.route_prefix + (field.real_name or magic._name)
 
-            if to_set is Ellipsis:
-                unsetters[route] = ""
-                setattr(underlying_owner, magic._name, field.default)
+                if to_set is Ellipsis:
+                    unsetters[route] = ""
+                    setattr(underlying_owner, magic._name, field.default)
 
-            elif to_set is not MISSING:
-                setters[route] = to_raw(to_set)
-                setattr(underlying_owner, magic._name, to_set)
+                elif to_set is not MISSING:
+                    setters[route] = to_raw(to_set)
+                    setattr(underlying_owner, magic._name, to_set)
 
-            containter = None
+                containter = None
 
-            if to_add:
-                adders[route].extend(to_raw(to_add))
-                containter = getattr(underlying_owner, magic._name)
-                if isinstance(containter, list):
-                    containter.extend(to_add)
-                elif isinstance(containter, set):
-                    containter.update(to_add)
+                if to_add:
+                    adders[route].extend(to_raw(to_add))
+                    containter = getattr(underlying_owner, magic._name)
+                    if isinstance(containter, list):
+                        containter.extend(to_add)
+                    elif isinstance(containter, set):
+                        containter.update(to_add)
 
-            if to_remove:
-                containter = containter or getattr(underlying_owner, magic._name)
-                removers[route].extend(to_raw(to_remove))
-                for el in to_remove:
-                    containter.remove(el)
+                if to_remove:
+                    containter = containter or getattr(underlying_owner, magic._name)
+                    removers[route].extend(to_raw(to_remove))
+                    for el in to_remove:
+                        containter.remove(el)
 
-            dict_attr = None
+                dict_attr = None
 
-            if to_update:
-                if not isinstance(field, FieldWithDict):
-                    raise SyntaxError(
-                        "Updating items of a field without items is not allowed"
-                    )
-                dict_attr = getattr(underlying_owner, magic._name)
-                for key, val in to_update.items():
-                    dict_attr[key] = val
-                    raw_key, raw_value = field.to_raw_item(key, val)
-                    setters[f"{route}.{raw_key}"] = raw_value
+                if to_update:
+                    if not isinstance(field, FieldWithDict):
+                        raise SyntaxError(
+                            "Updating items of a field without items is not allowed"
+                        )
+                    dict_attr = getattr(underlying_owner, magic._name)
+                    for key, val in to_update.items():
+                        dict_attr[key] = val
+                        raw_key, raw_value = field.to_raw_item(key, val)
+                        setters[f"{route}.{raw_key}"] = raw_value
 
-            if to_pop:
-                dict_attr = dict_attr or getattr(underlying_owner, magic._name)
+                if to_pop:
+                    dict_attr = dict_attr or getattr(underlying_owner, magic._name)
 
-                if isinstance(field, FieldWithDict):
-                    to_raw_key = lambda x: field.to_raw_item(x, dict_attr.get(x))[0]  # type: ignore
-                elif isinstance(field, FieldWithNestings):
-                    to_raw_key = field.to_raw_key
-                else:
-                    raise SyntaxError(
-                        "Removing items from a field without items is not allowed"
-                    )
+                    if isinstance(field, FieldWithDict):
+                        to_raw_key = lambda x: field.to_raw_item(x, dict_attr.get(x))[0]  # type: ignore
+                    elif isinstance(field, FieldWithNestings):
+                        to_raw_key = field.to_raw_key
+                    else:
+                        raise SyntaxError(
+                            "Removing items from a field without items is not allowed"
+                        )
 
-                for key in to_pop:
-                    raw_key = to_raw_key(key)
-                    dict_attr.pop(key, None)
-                    unsetters[f"{route}.{raw_key}"] = ""
+                    for key in to_pop:
+                        raw_key = to_raw_key(key)
+                        dict_attr.pop(key, None)
+                        unsetters[f"{route}.{raw_key}"] = ""
 
-        self._inject_nesting_branches()
-        upsert = False
+            self._inject_nesting_branches()
+            upsert = False
 
-        if setters:
-            mongo_command["$set"] = setters
-            upsert = True
+            if setters:
+                mongo_command["$set"] = setters
+                upsert = True
 
-        if unsetters:
-            mongo_command["$unset"] = unsetters
+            if unsetters:
+                mongo_command["$unset"] = unsetters
 
-        if adders:
-            mongo_command["$addToSet"] = {
-                key: ({"$each": value} if len(value) > 1 else value[0])
-                for key, value in adders.items()
-            }
-            upsert = True
+            if adders:
+                mongo_command["$addToSet"] = {
+                    key: ({"$each": value} if len(value) > 1 else value[0])
+                    for key, value in adders.items()
+                }
+                upsert = True
 
-        if removers:
-            mongo_command["$pull"] = {
-                key: ({"$in": value} if len(value) > 1 else value[0])
-                for key, value in removers.items()
-            }
+            if removers:
+                mongo_command["$pull"] = {
+                    key: ({"$in": value} if len(value) > 1 else value[0])
+                    for key, value in removers.items()
+                }
 
-        if not mongo_command:
-            return
+            if not mongo_command:
+                return
 
-        if self._underlying is not None:
-            doc = self._underlying.document
-            await doc.mongo_col.update_one(
-                {"_id": doc.id}, mongo_command, upsert=upsert
+            if self._underlying is not None:
+                doc = self._underlying.document
+                await doc.mongo_col.update_one(
+                    {"_id": doc.id}, mongo_command, upsert=upsert
+                )
+                self._clear_references()
+                return
+
+            raise ValueError(
+                "CommandMaker is unable to find a mongo-collection instance to make a request"
             )
-            return
-
-        raise ValueError(
-            "CommandMaker is unable to find a mongo-collection instance to make a request"
-        )
+        finally:
+            self._clear_references()
 
     def _get_underlying_owner(self) -> Any:
         # get the model that owns an attribute corresponding to this command maker
@@ -509,6 +514,18 @@ class CommandMaker:
             self._pseudo_attrs.values(), self._pseudo_nestings.values()
         ):
             magic._inject_nesting_branches()
+
+    def _clear_references(self) -> None:
+        self._parent = None
+        self._underlying = None
+
+        for magic in itertools.chain(
+            self._pseudo_attrs.values(), self._pseudo_nestings.values()
+        ):
+            magic._clear_references()
+
+        self._pseudo_attrs.clear()
+        self._pseudo_nestings.clear()
 
     def append(self, obj: Any) -> None:
         """This will append the object right before sending the mongo command"""
