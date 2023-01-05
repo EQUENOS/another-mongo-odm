@@ -1,6 +1,6 @@
 # Disclaimer
 
-This is an ORM I'm going to use in my projects. I'm publishing this because my friends asked.
+This ODM is motivated by my private ODM-like projects. I'm publishing this because my friends asked.
 
 Currently this project's state is "proof of concept".
 
