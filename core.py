@@ -484,8 +484,9 @@ class CommandMaker:
             raise ValueError(
                 "CommandMaker is unable to find a mongo-collection instance to make a request"
             )
-        finally:
+        except Exception:
             self._clear_references()
+            raise
 
     def _get_underlying_owner(self) -> Any:
         # get the model that owns an attribute corresponding to this command maker
