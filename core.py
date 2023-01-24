@@ -282,8 +282,8 @@ class CommandMaker:
         self._underlying: Any = underlying
         self._parent: Optional[CommandMaker] = parent
         self._name: str = name
-        self._route: str = f"{parent._route}{name}." if parent else name
         self._value: Any = value
+        self._to_inc: Any = None
         self._to_add: List[Any] = []
         self._to_remove: List[Any] = []
         self._to_update: Dict[Any, Any] = {}
@@ -356,9 +356,13 @@ class CommandMaker:
         if isinstance(value, NiceNesting):
             raise ValueError(
                 "You're not supposed to directly assign nestings to dict keys. "
-                "Modify the attributes of nestings like cmd.things[key].attr = value"
+                "Modify the attributes of nestings directly: cmd.things[key].attr = value"
             )
         self._to_update[key] = value
+
+    def __iadd__(self, value: Any) -> Any:
+        self._to_inc = value
+        return self
 
     async def __aenter__(self) -> Self:
         return self
@@ -379,6 +383,7 @@ class CommandMaker:
             to_remove = magic._to_remove
             to_update = magic._to_update
             to_pop = magic._to_pop
+            to_inc = magic._to_inc
 
             underlying_owner = magic._get_underlying_owner()
             if not isinstance(underlying_owner, NiceNesting):
@@ -397,6 +402,13 @@ class CommandMaker:
             elif to_set is not MISSING:
                 setters[route] = field.to_raw(to_set)
                 setattr(underlying_owner, magic._name, to_set)
+
+            if to_inc is not None:
+                # we're not going to use "$inc" because we should still support conversion
+                # (e.g. string to int and back)
+                new_value = magic._underlying + to_inc
+                setters[route] = field.to_raw(new_value)
+                setattr(underlying_owner, magic._name, new_value)
 
             containter = None
 
@@ -499,6 +511,7 @@ class CommandMaker:
                 yield magic
 
     def _inject_nesting_branches(self) -> None:
+        # this is done to bind newly created nestings to their corresponding cached parents
         for key, fake_nesting in self._pseudo_nestings.items():
             if key not in self._underlying:
                 self._underlying[key] = fake_nesting._underlying
