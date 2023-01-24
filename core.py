@@ -271,7 +271,7 @@ class CommandMaker:
     Here `cmd` is an instance of `CommandMaker`, even though it's annotated as NiceDocument.
     """
 
-    __slots__ = (
+    __slots__: Tuple[str, ...] = (
         "_underlying",
         "_underlying_owner",
         "_name",
