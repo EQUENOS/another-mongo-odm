@@ -271,16 +271,30 @@ class CommandMaker:
     Here `cmd` is an instance of `CommandMaker`, even though it's annotated as NiceDocument.
     """
 
+    __slots__ = (
+        "_underlying",
+        "_underlying_owner",
+        "_name",
+        "_value",
+        "_to_inc",
+        "_to_add",
+        "_to_remove",
+        "_to_update",
+        "_to_pop",
+        "_pseudo_nestings",
+        "_pseudo_attrs",
+    )
+
     def __init__(
         self,
         name: str = "",
         value: Any = MISSING,
         *,
-        parent: Optional["CommandMaker"] = None,
         underlying: Any = None,
+        underlying_owner: Any = None,
     ):
         self._underlying: Any = underlying
-        self._parent: Optional[CommandMaker] = parent
+        self._underlying_owner: Any = underlying_owner
         self._name: str = name
         self._value: Any = value
         self._to_inc: Any = None
@@ -289,7 +303,6 @@ class CommandMaker:
         self._to_update: Dict[Any, Any] = {}
         self._to_pop: List[Any] = []
         self._pseudo_nestings: Dict[Any, CommandMaker] = {}
-        # having _pseudo_attrs after all other assignments is important
         self._pseudo_attrs: Dict[str, CommandMaker] = {}
 
     def __getattr__(self, name: str) -> Any:
@@ -299,17 +312,21 @@ class CommandMaker:
             return self._pseudo_attrs[name]
         # this also ensures that this attribute exists in the corresponding model
         sub_underlying = getattr(self._underlying, name)
-        sub_magic = self.__class__(name, parent=self, underlying=sub_underlying)
+        sub_magic = self.__class__(
+            name, underlying=sub_underlying, underlying_owner=self._underlying
+        )
         self._pseudo_attrs[name] = sub_magic
         return sub_magic
 
     def __setattr__(self, name: str, value: Any) -> None:
         # We want to maintain the original __setattr__ behaviour for existing attributes.
         # For fake attributes we want special behaviour.
-        _dict = self.__dict__
-        if "_pseudo_attrs" not in _dict or name in _dict:
-            # we're still in __init__ or this attribute already exists
+        if name in self.__slots__:
             return object.__setattr__(self, name, value)
+
+        if isinstance(value, CommandMaker):
+            # ideally this happens only after __iadd__
+            return
 
         sub_magic = self._pseudo_attrs.get(name)
         if sub_magic is not None:
@@ -318,18 +335,17 @@ class CommandMaker:
         # this also ensures that this attribute exists in the corresponding model
         sub_underlying = getattr(self._underlying, name)
         self._pseudo_attrs[name] = self.__class__(
-            name, value, parent=self, underlying=sub_underlying
+            name, value, underlying=sub_underlying, underlying_owner=self._underlying
         )
 
     def __getitem__(self, key: Any) -> Any:
         # Once we're here, it means that this instance fakes a dict attribute.
         # The only thing we should take care of is the possibility that
         # the real value under this key is a nesting.
-        real_owner = self._get_underlying_owner()
-        if not isinstance(real_owner, NiceNesting):
+        if not isinstance(self._underlying_owner, NiceNesting):
             raise SyntaxError("You're not supposed to get items of this attribute")
 
-        _field = real_owner._nice_nestings.get(self._name)
+        _field = self._underlying_owner._nice_nestings.get(self._name)
         if not isinstance(_field, FieldWithNestings):
             raise SyntaxError("You're not supposed to get items of this attribute")
 
@@ -342,11 +358,13 @@ class CommandMaker:
             sub_underlying = _field.cls(
                 attr_name="",
                 data=None,
-                parent=real_owner,
+                parent=self._underlying_owner,
                 alias=f"{_field.real_name or self._name}.{_field.to_raw_key(key)}",
             )
 
-        sub_magic = self.__class__(str(key), parent=self, underlying=sub_underlying)
+        sub_magic = self.__class__(
+            str(key), underlying=sub_underlying, underlying_owner=self._underlying
+        )
         self._pseudo_nestings[key] = sub_magic
         return sub_magic
 
@@ -385,7 +403,7 @@ class CommandMaker:
             to_pop = magic._to_pop
             to_inc = magic._to_inc
 
-            underlying_owner = magic._get_underlying_owner()
+            underlying_owner = magic._underlying_owner
             if not isinstance(underlying_owner, NiceNesting):
                 raise ValueError("Updating irrelevant attributes is not allowed")
             # this also ensures that the user updated an existing field
@@ -406,7 +424,7 @@ class CommandMaker:
             if to_inc is not None:
                 # we're not going to use "$inc" because we should still support conversion
                 # (e.g. string to int and back)
-                new_value = magic._underlying + to_inc
+                new_value = getattr(underlying_owner, magic._name) + to_inc
                 setters[route] = field.to_raw(new_value)
                 setattr(underlying_owner, magic._name, new_value)
 
@@ -492,12 +510,6 @@ class CommandMaker:
         raise ValueError(
             "CommandMaker is unable to find a mongo-collection instance to make a request"
         )
-
-    def _get_underlying_owner(self) -> Any:
-        # get the model that owns an attribute corresponding to this command maker
-        if self._parent is None:
-            raise ValueError("Updating attributes other than fields is illegal")
-        return self._parent._underlying
 
     def _iter_leaves(self) -> Generator["CommandMaker", None, None]:
         for magic in itertools.chain(
@@ -620,7 +632,7 @@ class NiceNesting(metaclass=FieldExtractingMeta):
 
     def command_maker(self) -> Self:
         # here the return type is 'Self' because
-        # I want an IDE to autocomplete attribute names
+        # I want IDEs to autocomplete attribute names
         return CommandMaker(self.route_prefix, underlying=self)  # type: ignore
 
     cmdmk = command_maker
