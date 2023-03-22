@@ -2,7 +2,6 @@ import itertools
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from copy import copy
-from functools import cached_property
 from typing import (
     Any,
     AsyncIterator,
@@ -74,7 +73,7 @@ class AsyncCollection:
 
 
 class FieldExtractingMeta(type):
-    def __new__(cls, name: str, bases: Tuple[type, ...], _dict: Dict[str, Any]):
+    def __new__(cls, _name: str, _bases: Tuple[type, ...], _dict: Dict[str, Any]):
         fields = {}
         nice_nestings = {}
         invalidated_attrs = []
@@ -90,9 +89,15 @@ class FieldExtractingMeta(type):
         for name in invalidated_attrs:
             _dict.pop(name, None)
 
+        if fields or nice_nestings:
+            slots = tuple(itertools.chain(fields.keys(), nice_nestings.keys()))
+            if "__slots__" in _dict:
+                slots += _dict["__slots__"]
+            _dict["__slots__"] = slots
+
         _dict["_fields"] = fields
         _dict["_nice_nestings"] = nice_nestings
-        return super().__new__(cls, name, bases, _dict)
+        return super().__new__(cls, _name, _bases, _dict)
 
 
 class FieldBase(ABC):
@@ -132,6 +137,7 @@ class Field(FieldBase):
         identity = lambda x: x
         self._from_raw: Callable[[T1], T2] = from_raw or identity
         self._to_raw: Callable[[T2], T1] = to_raw or identity
+        self._cache_binding: Optional[Dict[Any, Any]] = None
 
     def from_raw(self, value):
         if value is None:
@@ -220,15 +226,18 @@ class FieldWithNestings(FieldBase):
         if data is None:
             return self.default
 
-        return {
-            self.from_raw_key(k): self.cls(
+        res = {}
+        for k, v in data.items():
+            key = self.from_raw_key(k)
+            res[key] = self.cls(
                 attr_name="",
+                id=key,
                 data=v,
                 parent=parent,
                 alias=f"{self.real_name or attr_name}.{k}",
             )
-            for k, v in data.items()
-        }
+
+        return res
 
     def to_raw(self, _) -> Any:
         # this must never be used with nestings
@@ -248,7 +257,11 @@ class NestingFactory(FieldBase):
         self, data: Optional[dict], attr_name: str, parent: "NiceNesting"
     ) -> "NiceNesting":
         return self.cls(
-            attr_name=attr_name, data=data, parent=parent, alias=self.real_name
+            attr_name=attr_name,
+            id=attr_name,
+            data=data,
+            parent=parent,
+            alias=self.real_name,
         )
 
     def to_raw(self, _) -> Any:
@@ -357,6 +370,7 @@ class CommandMaker:
         if sub_underlying is None:
             sub_underlying = _field.cls(
                 attr_name="",
+                id=key,
                 data=None,
                 parent=self._underlying_owner,
                 alias=f"{_field.real_name or self._name}.{_field.to_raw_key(key)}",
@@ -386,7 +400,7 @@ class CommandMaker:
         return self
 
     async def __aexit__(self, exc: Any, *_) -> None:
-        if exc is not None:
+        if exc is not None or self._underlying is None:
             return
 
         mongo_command = {}
@@ -394,6 +408,7 @@ class CommandMaker:
         unsetters = {}
         adders = defaultdict(list)
         removers = defaultdict(list)
+        doc = self._underlying.document
 
         for magic in self._iter_leaves():
             to_set = magic._value
@@ -416,10 +431,12 @@ class CommandMaker:
             if to_set is Ellipsis:
                 unsetters[route] = ""
                 setattr(underlying_owner, magic._name, field.default)
+                self._binding_pop(field, doc.id)
 
             elif to_set is not MISSING:
                 setters[route] = field.to_raw(to_set)
                 setattr(underlying_owner, magic._name, to_set)
+                self._binding_update(field, doc.id, to_set)
 
             if to_inc is not None:
                 # we're not going to use "$inc" because we should still support conversion
@@ -427,6 +444,7 @@ class CommandMaker:
                 new_value = getattr(underlying_owner, magic._name) + to_inc
                 setters[route] = field.to_raw(new_value)
                 setattr(underlying_owner, magic._name, new_value)
+                self._binding_update(field, doc.id, new_value)
 
             containter = None
 
@@ -500,16 +518,17 @@ class CommandMaker:
         if not mongo_command:
             return
 
-        if self._underlying is not None:
-            doc = self._underlying.document
-            await doc.mongo_col.update_one(
-                {"_id": doc.id}, mongo_command, upsert=upsert
-            )
-            return
+        await doc.mongo_col.update_one({"_id": doc.id}, mongo_command, upsert=upsert)
 
-        raise ValueError(
-            "CommandMaker is unable to find a mongo-collection instance to make a request"
-        )
+    def _binding_pop(self, field: FieldBase, doc_id: Any) -> None:
+        if not isinstance(field, Field) or field._cache_binding is None:
+            return
+        field._cache_binding.pop(doc_id, None)
+
+    def _binding_update(self, field: FieldBase, doc_id: Any, value: Any) -> None:
+        if not isinstance(field, Field) or field._cache_binding is None:
+            return
+        field._cache_binding[doc_id] = value
 
     def _iter_leaves(self) -> Generator["CommandMaker", None, None]:
         for magic in itertools.chain(
@@ -558,23 +577,30 @@ class CommandMaker:
         self._to_pop.append(key)
 
 
-class NiceNesting(metaclass=FieldExtractingMeta):
+class NiceNesting(Generic[NiceDocumentT], metaclass=FieldExtractingMeta):
     """The base class for all nestings"""
 
     _fields: Dict[str, FieldBase]
     _nice_nestings: Dict[str, Union[NestingFactory, FieldWithNestings]]
 
+    __slots__ = ("id", "_parent", "_name", "_alias", "_cs_route_prefix", "_cs_document")
+    # slots for fields are populated automatically
+
     def __init__(
         self,
         *,
         attr_name: str,
+        id: Any,
         data: Optional[Dict[str, Any]],
         parent: Optional["NiceNesting"],
         alias: Optional[str] = None,
     ):
+        self.id: Any = id
         self._parent: Optional[NiceNesting] = parent
         self._name: str = attr_name
         self._alias: Optional[str] = alias
+        self._cs_route_prefix: Optional[str] = None
+        self._cs_document: Optional[NiceDocumentT] = None
 
         if data is None:
             data = {}
@@ -601,30 +627,40 @@ class NiceNesting(metaclass=FieldExtractingMeta):
     def mongo_name(self) -> str:
         return self._alias or self._name
 
-    @cached_property
+    @property
     def route_prefix(self) -> str:
+        if self._cs_route_prefix is not None:
+            return self._cs_route_prefix
         if isinstance(self._parent, NiceDocument):
-            return f"{self.mongo_name}."
+            res = f"{self.mongo_name}."
         elif isinstance(self._parent, NiceNesting):
-            return f"{self._parent.route_prefix}{self.mongo_name}."
-        raise ValueError(
-            f"Invalid parent type of '{self._name}': {self.__class__.__name__}"
-        )
+            res = f"{self._parent.route_prefix}{self.mongo_name}."
+        else:
+            raise ValueError(
+                f"Invalid parent type of '{self._name}': {self.__class__.__name__}"
+            )
+        self._cs_route_prefix = res
+        return res
 
-    @cached_property
-    def document(self) -> "NiceDocument":
+    @property
+    def document(self) -> NiceDocumentT:
         if self._parent is None:
             raise ValueError(
                 "This nesting is not usable yet. Add it to a dict of nestings first."
             )
+        if self._cs_document is not None:
+            return self._cs_document
 
         if isinstance(self._parent, NiceDocument):
-            return self._parent
+            res: NiceDocumentT = self._parent  # type: ignore
         elif isinstance(self._parent, NiceNesting):
-            return self._parent.document
-        raise ValueError(
-            f"Invalid parent type of '{self._name}': {self.__class__.__name__}"
-        )
+            res = self._parent.document
+        else:
+            raise ValueError(
+                f"Invalid parent type of '{self._name}': {self.__class__.__name__}"
+            )
+        self._cs_document = res
+        return res
 
     @property
     def mongo_col(self) -> AsyncCollection:
@@ -641,9 +677,12 @@ class NiceNesting(metaclass=FieldExtractingMeta):
 class NiceDocument(NiceNesting):
     """The base class for document wrappers"""
 
+    id: Union[int, str]
+
+    __slots__ = ("collection", "_last_used_at")
+
     def __init__(self, data: Dict[str, Any], collection: "NiceCollection"):
-        super().__init__(attr_name="", data=data, parent=None)
-        self.id: Union[int, str] = data["_id"]
+        super().__init__(attr_name="", id=data["_id"], data=data, parent=None)
         self.collection: NiceCollection = collection
         self._last_used_at: float = time()
 
@@ -652,7 +691,7 @@ class NiceDocument(NiceNesting):
         return ""
 
     @property
-    def document(self) -> "NiceDocument":
+    def document(self) -> Self:
         return self
 
     @property
@@ -699,9 +738,18 @@ class NiceDocument(NiceNesting):
         """
         return NiceCollection(collection, cls, cache_lifetime)
 
+    def _collect_cache_bindings(self) -> List[Dict[Any, Any]]:
+        res = []
+        for field in self._fields.values():
+            if isinstance(field, Field) and field._cache_binding is not None:
+                res.append(field._cache_binding)
+        return res
+
     async def delete(self) -> None:
         """Deletes the document from both database and cache."""
         await self.collection.delete(self.id)
+        for mapping in self._collect_cache_bindings():
+            mapping.pop(self.id, None)
 
 
 class NiceCollection(Generic[NiceDocumentT]):
@@ -750,6 +798,30 @@ class NiceCollection(Generic[NiceDocumentT]):
             self.cache.pop(key, None)
         self._last_cache_check = now
 
+    def create_cache_bindings(self, **mappings: Dict[Any, Any]) -> None:
+        """Binds dicts of form `{doc_id: field_value, ...}` to regular fields
+        to keep them in sync with field values.
+
+        Example
+        -------
+        The following example binds `id_to_price_mapping` to a field named `price`:
+        ```python
+            id_to_price_mapping = {}
+            doc.create_cache_bindings(price=id_to_price_mapping)
+        ```
+        """
+        for key, value in mappings.items():
+            if key not in self.document_wrapper._fields:
+                raise AttributeError(
+                    f"'{self.__class__.__name__}' object has no attribute '{key}'"
+                )
+            _field = self.document_wrapper._fields[key]
+            if not isinstance(_field, Field):
+                raise TypeError(
+                    f"'{self.__class__.__name__}.{key}' is not a regular field"
+                )
+            _field._cache_binding = value
+
     def get_cached_or_minimal(self, id: Union[int, str]) -> NiceDocumentT:
         """Returns a cached document with the given ID.
         If nothing was found, creates a minimal mock document.
@@ -786,6 +858,13 @@ class NiceCollection(Generic[NiceDocumentT]):
             self.cache[doc.id] = doc
 
         return doc
+
+    async def cache_all(self) -> None:
+        """Fetches all documents and caches them. This may take a while."""
+        results = self.mongo_col.find({})
+        async for res in results:
+            doc = self.document_wrapper(res, self)
+            self.cache[doc.id] = doc
 
     async def delete(self, id: Union[int, str]) -> None:
         """Deletes the document with the given ID from both database and cache."""
